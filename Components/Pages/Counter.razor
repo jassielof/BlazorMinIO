@@ -1,18 +1,320 @@
 ﻿@page "/counter"
+@using Minio
+@using Minio.DataModel.Args
+@using Minio.Exceptions
+@using Microsoft.AspNetCore.Components.Forms // Required for IBrowserFile
+@inject IMinioClient MinioClient
+@inject ISnackbar Snackbar
 
-<PageTitle>Counter</PageTitle>
+<PageTitle>MinIO Manager</PageTitle>
 
-<MudText Typo="Typo.h3" GutterBottom="true">Counter</MudText>
+<MudText Typo="Typo.h3" GutterBottom="true">MinIO Storage Manager</MudText>
 
-<MudText Typo="Typo.body1" Class="mb-4">Current count: @currentCount</MudText>
+<MudGrid Spacing="3">
+    <MudItem xs="12" sm="6">
+        <MudPaper Class="pa-4 elevation-2">
+            <MudText Typo="Typo.h5" GutterBottom="true">Create Bucket</MudText>
+            <MudTextField @bind-Value="newBucketName" Label="New Bucket Name" Variant="Variant.Outlined" Disabled="@isProcessing" />
+            <MudButton OnClick="CreateBucketAsync" Variant="Variant.Filled" Color="Color.Primary" Class="mt-2" Disabled="@isProcessing">
+                @if (isProcessing && creatingBucket) { <MudProgressCircular Indeterminate="true" Size="Size.Small" Class="mr-2" /> } Create Bucket
+            </MudButton>
+        </MudPaper>
+    </MudItem>
 
-<MudButton Color="Color.Primary" Variant="Variant.Filled" @onclick="IncrementCount">Click me</MudButton>
+    <MudItem xs="12" sm="6">
+        <MudPaper Class="pa-4 elevation-2">
+            <MudText Typo="Typo.h5" GutterBottom="true">Upload File</MudText>
+            @if (bucketsWithFiles != null && bucketsWithFiles.Any(b => !b.BucketName.StartsWith("Error:")))
+            {
+                <MudSelect @bind-Value="selectedBucketForUpload" Label="Select Bucket" Variant="Variant.Outlined" Disabled="@isProcessing">
+                    @foreach (var bucket in bucketsWithFiles.Where(b => !b.BucketName.StartsWith("Error:")))
+                    {
+                        <MudSelectItem Value="@bucket.BucketName">@bucket.BucketName</MudSelectItem>
+                    }
+                </MudSelect>
+
+                <MudFileUpload T="IReadOnlyList<IBrowserFile>"
+                               FilesChanged="HandleFileSelected"
+                               Class="mt-2"
+                               Disabled="@(isProcessing || string.IsNullOrWhiteSpace(selectedBucketForUpload))"
+                               Accept=".zip,.jpg,.jpeg,.png,.txt,.pdf,.doc,.docx"
+                               ButtonTemplate="@CustomButtonTemplate">
+                    @* Ensure no other content is directly inside MudFileUpload unless it's for ChildContent,
+                       though be mindful of the MUD0002 warning if you use ChildContent. *@
+                </MudFileUpload>
+                @if (selectedFileToUpload != null)
+                {
+                    <MudText Class="mt-2">Selected: @selectedFileToUpload.Name (@FormatBytes(selectedFileToUpload.Size))</MudText>
+                    <MudButton OnClick="UploadSelectedFileAsync" Variant="Variant.Filled" Color="Color.Success" Class="mt-2" Disabled="@(isProcessing || selectedFileToUpload == null)">
+                         @if (isProcessing && uploadingFile) { <MudProgressCircular Indeterminate="true" Size="Size.Small" Class="mr-2" /> } Upload File
+                    </MudButton>
+                }
+            }
+            else if (!isProcessing)
+            {
+                <MudText>Create a bucket first or ensure buckets are loaded correctly to enable uploads.</MudText>
+            }
+        </MudPaper>
+    </MudItem>
+
+    <MudItem xs="12">
+        <MudPaper Class="pa-4 elevation-2">
+            <div class="d-flex justify-space-between align-center mb-2">
+                <MudText Typo="Typo.h5" GutterBottom="false">Buckets and Files</MudText>
+                <MudIconButton Icon="@Icons.Material.Filled.Refresh" OnClick="LoadBucketsAndFilesAsync" Disabled="@isProcessing" Title="Refresh List"></MudIconButton>
+            </div>
+            @if (isProcessing && bucketsWithFiles == null)
+            {
+                <MudProgressCircular Indeterminate="true" Color="Color.Primary" />
+            }
+            else if (bucketsWithFiles == null || !bucketsWithFiles.Any())
+            {
+                <MudText>No buckets found. Create one or check MinIO connection.</MudText>
+            }
+            else
+            {
+                <MudList T="BucketWithFiles" Dense="true">
+                    @foreach (var bucket in bucketsWithFiles)
+                    {
+                        <MudListItem>
+                            <MudText Color="@(bucket.BucketName.StartsWith("Error:") ? Color.Error : Color.Primary)" Typo="Typo.subtitle1"><strong>@bucket.BucketName</strong></MudText>
+                            @if (bucket.Files.Count == 0 && !bucket.BucketName.StartsWith("Error:"))
+                            {
+                                <MudText Class="ml-4"><em>No files found.</em></MudText>
+                            }
+                            else if (bucket.Files.Any())
+                            {
+                                <MudList Class="ml-4" Dense="true">
+                                    @foreach (var file in bucket.Files)
+                                    {
+                                        <MudListItem>
+                                            <MudText Typo="Typo.body2">@file</MudText>
+                                        </MudListItem>
+                                    }
+                                </MudList>
+                            }
+                        </MudListItem>
+                        <MudDivider />
+                    }
+                </MudList>
+            }
+        </MudPaper>
+    </MudItem>
+</MudGrid>
 
 @code {
-    private int currentCount = 0;
+    private List<BucketWithFiles>? bucketsWithFiles;
+    private string newBucketName = "";
+    private string? selectedBucketForUpload;
+    private IBrowserFile? selectedFileToUpload;
 
-    private void IncrementCount()
+    private bool isProcessing = false;
+    private bool creatingBucket = false;
+    private bool uploadingFile = false;
+
+    // Define the RenderFragment for the ButtonTemplate
+    // The 'inputId' parameter is provided by MudFileUpload and is the ID of the hidden file input
+    private RenderFragment<string> CustomButtonTemplate => (inputId) =>@<MudButton HtmlTag="label"
+                                                                                  Variant="Variant.Filled"
+                                                                                  Color="Color.Secondary"
+                                                                                  StartIcon="@Icons.Material.Filled.CloudUpload"
+                                                                                  Disabled="@(isProcessing || string.IsNullOrWhiteSpace(selectedBucketForUpload))"
+                                                                                  for="@inputId">
+                                                                       Select File
+                                                                   </MudButton>;
+
+    protected override async Task OnInitializedAsync()
     {
-        currentCount++;
+        await LoadBucketsAndFilesAsync();
+    }
+
+    private async Task LoadBucketsAndFilesAsync()
+    {
+        if (isProcessing) return;
+        isProcessing = true;
+        await InvokeAsync(StateHasChanged); // Use InvokeAsync
+
+        try
+        {
+            var result = await MinioClient.ListBucketsAsync().ConfigureAwait(false);
+            var tempBucketsWithFiles = new List<BucketWithFiles>();
+
+            if (result?.Buckets != null)
+            {
+                foreach (var bucket in result.Buckets)
+                {
+                    var files = new List<string>();
+                    try
+                    {
+                        var listArgs = new ListObjectsArgs().WithBucket(bucket.Name);
+                        // ListObjectsEnumAsync is an IAsyncEnumerable, await foreach handles context correctly usually
+                        // but operations within the loop might need care if they also call StateHasChanged indirectly.
+                        await foreach (var obj in MinioClient.ListObjectsEnumAsync(listArgs).ConfigureAwait(false))
+                        {
+                            files.Add(obj.Key);
+                        }
+                    }
+                    catch (Exception exListObjects)
+                    {
+                        files.Add($"Error listing files: {exListObjects.Message.Split('.')[0]}"); // Short error
+                        Console.WriteLine($"Error listing objects in bucket {bucket.Name}: {exListObjects}");
+                    }
+                    tempBucketsWithFiles.Add(new BucketWithFiles
+                    {
+                        BucketName = bucket.Name,
+                        Files = files
+                    });
+                }
+            }
+            bucketsWithFiles = tempBucketsWithFiles;
+            if (bucketsWithFiles != null && !bucketsWithFiles.Any(b => !b.BucketName.StartsWith("Error:")) && selectedBucketForUpload != null)
+            {
+                 // Check if the selected bucket still exists and is valid
+                if (!bucketsWithFiles.Any(b => b.BucketName == selectedBucketForUpload && !b.BucketName.StartsWith("Error:")))
+                {
+                    selectedBucketForUpload = null; // Reset if selected bucket disappeared or errored
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            bucketsWithFiles = new List<BucketWithFiles>
+            {
+                new BucketWithFiles { BucketName = $"Error loading buckets: {ex.Message.Split('.')[0]}", Files = new List<string>() }
+            };
+            Snackbar.Add($"Error loading MinIO data: {ex.Message}", Severity.Error);
+            Console.WriteLine($"Error fetching MinIO data: {ex.ToString()}");
+        }
+        finally
+        {
+            isProcessing = false;
+            await InvokeAsync(StateHasChanged); // Use InvokeAsync - THIS IS LINE 186
+        }
+    }
+
+    private async Task CreateBucketAsync()
+    {
+        if (string.IsNullOrWhiteSpace(newBucketName))
+        {
+            Snackbar.Add("Bucket name cannot be empty.", Severity.Warning);
+            return;
+        }
+        if (isProcessing) return;
+
+        isProcessing = true;
+        creatingBucket = true;
+        await InvokeAsync(StateHasChanged); // Use InvokeAsync
+
+        try
+        {
+            var beArgs = new BucketExistsArgs().WithBucket(newBucketName);
+            bool found = await MinioClient.BucketExistsAsync(beArgs).ConfigureAwait(false);
+            if (found)
+            {
+                Snackbar.Add($"Bucket '{newBucketName}' already exists.", Severity.Info);
+            }
+            else
+            {
+                var mbArgs = new MakeBucketArgs().WithBucket(newBucketName);
+                await MinioClient.MakeBucketAsync(mbArgs).ConfigureAwait(false);
+                Snackbar.Add($"Bucket '{newBucketName}' created successfully.", Severity.Success);
+                newBucketName = ""; // Clear input
+            }
+            // LoadBucketsAndFilesAsync already handles its own StateHasChanged via InvokeAsync
+            await LoadBucketsAndFilesAsync();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"Error creating bucket: {ex.Message}", Severity.Error);
+            Console.WriteLine($"Error creating bucket '{newBucketName}': {ex.ToString()}");
+        }
+        finally
+        {
+            isProcessing = false;
+            creatingBucket = false;
+            // State will be updated by LoadBucketsAndFilesAsync or if an error occurs before it,
+            // we might need one here if LoadBucketsAndFilesAsync isn't called due to an early return/exception.
+            // However, LoadBucketsAndFilesAsync is called in the try block.
+            // The final StateHasChanged in LoadBucketsAndFilesAsync should cover this.
+            // For safety, if an exception happens before LoadBucketsAndFilesAsync, this ensures UI update.
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async void HandleFileSelected(IReadOnlyList<IBrowserFile> files) // Consider Task return type if any await is needed
+    {
+        selectedFileToUpload = files.FirstOrDefault();
+        await InvokeAsync(StateHasChanged); // Use InvokeAsync
+    }
+
+    private async Task UploadSelectedFileAsync()
+    {
+        if (selectedFileToUpload == null)
+        {
+            Snackbar.Add("No file selected to upload.", Severity.Warning);
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(selectedBucketForUpload))
+        {
+            Snackbar.Add("Please select a bucket to upload to.", Severity.Warning);
+            return;
+        }
+        if (isProcessing) return;
+
+        isProcessing = true;
+        uploadingFile = true;
+        await InvokeAsync(StateHasChanged); // Use InvokeAsync
+
+        try
+        {
+            await using var stream = selectedFileToUpload.OpenReadStream(maxAllowedSize: 20 * 1024 * 1024);
+
+            var putObjectArgs = new PutObjectArgs()
+                .WithBucket(selectedBucketForUpload)
+                .WithObject(selectedFileToUpload.Name)
+                .WithStreamData(stream)
+                .WithObjectSize(selectedFileToUpload.Size)
+                .WithContentType(selectedFileToUpload.ContentType);
+
+            await MinioClient.PutObjectAsync(putObjectArgs).ConfigureAwait(false);
+            Snackbar.Add($"File '{selectedFileToUpload.Name}' uploaded to '{selectedBucketForUpload}' successfully.", Severity.Success);
+            selectedFileToUpload = null; // Clear selected file
+            // LoadBucketsAndFilesAsync already handles its own StateHasChanged via InvokeAsync
+            await LoadBucketsAndFilesAsync();
+        }
+        catch (Exception ex)
+        {
+            Snackbar.Add($"Error uploading file: {ex.Message}", Severity.Error);
+            Console.WriteLine($"Error uploading file '{selectedFileToUpload?.Name}' to bucket '{selectedBucketForUpload}': {ex.ToString()}");
+        }
+        finally
+        {
+            isProcessing = false;
+            uploadingFile = false;
+            // Similar to CreateBucketAsync, LoadBucketsAndFilesAsync should handle the final UI update.
+            // Adding one here for safety if an exception occurs before LoadBucketsAndFilesAsync.
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] suffixes = { "B", "KB", "MB", "GB", "TB" };
+        int i = 0;
+        double dblSByte = bytes;
+        if (bytes > 1024)
+        {
+            for (i = 0; (bytes / 1024) > 0 && i < suffixes.Length -1; i++, bytes /= 1024)
+            {
+                dblSByte = bytes / 1024.0;
+            }
+        }
+        return $"{dblSByte:0.##} {suffixes[i]}";
+    }
+
+    private class BucketWithFiles
+    {
+        public string BucketName { get; set; } = "";
+        public List<string> Files { get; set; } = new();
     }
 }
